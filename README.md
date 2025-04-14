@@ -1,6 +1,6 @@
-# LncLocFormer
+# LncMamba
 
-**LncLocFormer** is a machine learning project designed for predicting the subcellular localization of long non-coding RNAs (lncRNAs). It integrates several advanced components and provides an environment for training, testing, and visualizing the results of deep learning models. This project is based on Mamba2, and it includes various modules for model building, training, and visualization.
+**LncMamba** is a machine learning project designed for predicting the subcellular localization of long non-coding RNAs (lncRNAs). It integrates several advanced components and provides an environment for training, testing, and visualizing the results of deep learning models. This project is based on Mamba2, and it includes various modules for model building, training, and visualization.
 
 ## Requirements
 
@@ -12,8 +12,8 @@
 
 ## Modules
 
-### 1. **LncLocFormer**
-   This module provides the base environment configuration and utilities for the project. It includes the core model definitions, which are key to the LncLocFormer framework.
+### 1. **LncMamba**
+   This module provides the base environment configuration and utilities for the project. It includes the core model definitions, which are key to the LncMamba framework.
 
    - **DL_ClassifierModel.py**: Contains the main deep learning model architecture for classifying the subcellular localization of lncRNAs.
    - **nnLayer.py**: Defines various neural network layers used in the model, ensuring modularity and flexibility in the design.
