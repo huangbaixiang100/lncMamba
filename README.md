@@ -28,7 +28,7 @@ pip install mamba_ssm==1.0.1
 
 ### 2. **Training and Visualization**
    - **train.py**: Contains the training loop for the model. After adjusting the dataset path, this script can be executed to start the training process.
-   - **motif analysis.py**: Responsible for saving the model's weights after training and visualizing the results, including training and validation curves.
+   - **motif analysis.py**: Responsible for saving the model's weights after training and visualizing the results, including motif analysis.
 
 Acknowledgement
 This code is based on Mamba(https://github.com/state-spaces/mamba),LncLocFormer(https://github.com/CSUBioGroup/LncLocFormer). Thanks for their awesome work.
