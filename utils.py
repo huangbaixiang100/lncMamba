@@ -8,8 +8,6 @@ from torch.utils.data import DataLoader,Dataset
 import torch.nn.functional as F
 from itertools import permutations
 from sklearn.feature_extraction.text import CountVectorizer
-# from gensim.models import Word2Vec,FastText
-# from glove import Glove, Corpus
 import logging,pickle
 logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s', level=logging.INFO)
 
@@ -82,55 +80,6 @@ class Tokenizer:
 
         return pContFeat
 
-    # def vectorize(self, sequences, method=["skipgram"], embSize=64, window=7, iters=10, batchWords=10000,
-    #               workers=8, loadCache=True, suf=""):
-    #     path = f'cache/{"-".join(method)}_d{embSize*len(method)}_{suf}.pkl'
-    #     if os.path.exists(path) and loadCache:
-    #         with open(path, 'rb') as f:
-    #             self.embedding = pickle.load(f)
-    #         print('Loaded cache from cache/%s'%path)
-    #     else:
-    #         corpus = [i+['[PAD]'] for i in sequences]
-    #         embeddings = []
-    #         if 'skipgram' in method:
-    #             model = Word2Vec(corpus, min_count=0, window=window, vector_size=embSize, workers=workers, sg=1, epochs=iters, batch_words=batchWords)
-    #             word2vec = np.zeros((self.tknNum, embSize), dtype=np.float32)
-    #             for i in range(self.tknNum):
-    #                 if self.id2tkn[i] in model.wv:
-    #                     word2vec[i] = model.wv[self.id2tkn[i]]
-    #                 else:
-    #                     print('word %s not in word2vec.'%self.id2tkn[i])
-    #                     word2vec[i] =  np.random.random(embSize)
-    #             embeddings.append(word2vec)
-    #         if 'glove' in method:
-    #             gCorpus = Corpus()
-    #             gCorpus.fit(corpus, window=window)
-    #             model = Glove(no_components=embSize)
-    #             model.fit(gCorpus.matrix, epochs=iters, no_threads=workers, verbose=True)
-    #             model.add_dictionary(gCorpus.dictionary)
-    #             word2vec = np.zeros((self.tknNum, embSize), dtype=np.float32)
-    #             for i in range(self.tknNum):
-    #                 if self.id2tkn[i] in model.dictionary:
-    #                     word2vec[i] = model.word_vectors[model.dictionary[self.id2tkn[i]]]
-    #                 else:
-    #                     print('word %s not in word2vec.'%self.id2tkn[i])
-    #                     word2vec[i] =  np.random.random(embSize)
-    #             embeddings.append(word2vec)
-    #         if 'fasttext' in method:
-    #             model = FastText(corpus, vector_size=embSize, window=window, min_count=0, epochs=iters, sg=1, workers=workers, batch_words=batchWords)
-    #             word2vec = np.zeros((self.tknNum, embSize), dtype=np.float32)
-    #             for i in range(self.tknNum):
-    #                 if self.id2tkn[i] in model.wv:
-    #                     word2vec[i] = model.wv[self.id2tkn[i]]
-    #                 else:
-    #                     print('word %s not in word2vec.'%self.id2tkn[i])
-    #                     word2vec[i] =  np.random.random(embSize)
-    #             embeddings.append(word2vec)
-    #         self.embedding = np.hstack(embeddings)
-
-    #         with open(path, 'wb') as f:
-    #             pickle.dump(self.embedding, f, protocol=4)
-
 class lncRNA_loc_dataset(Dataset):
     def __init__(self, dataPath, k=1, mode="csv"):
         self.dataPath = dataPath
@@ -165,40 +114,3 @@ class lncRNA_loc_dataset(Dataset):
     def cache_tokenizedKgpSeqArr(self, tokenizer, groups):
         self.groups = groups
         self.tokenizedKgpSeqArr = tokenizer.tokenize_sentences_to_k_group(self.sequences, groups)
-
-class lncRNA_loc_dataset_old(Dataset):
-    def __init__(self, dataPath, k=1):
-        self.dataPath = dataPath
-        with open(dataPath, 'r') as f:
-            data = [i.split() for i in f.readlines()]
-        tmp = [i[1] for i in data]
-        self.sequences = [[i[j-k//2:j+k//2+1] for j in range(k//2,len(i)-k//2)] for i in tmp]
-        self.labels = [[i[2]] for i in data]
-        self.sLens = [len(i) for i in tqdm(self.sequences)]
-    def __len__(self):
-        return len(self.sequences)
-    def __getitem__(self, index):
-        return {'sequence':self.sequences[index], 
-                'sLen':self.sLens[index],
-                'label':self.labels[index],
-                'tokenizedKgpSeqArr':self.tokenizedKgpSeqArr[index] if hasattr(self, 'tokenizedKgpSeqArr') else None}
-    def cache_tokenizedKgpSeqArr(self, tokenizer, groups):
-        self.groups = groups
-        self.tokenizedKgpSeqArr = tokenizer.tokenize_sentences_to_k_group(self.sequences, groups)
-
-class DM3Loc_lncRNA_dataset(Dataset):
-    def __init__(self, dataPath, labIndex):
-        self.dataPath = dataPath
-        with open(dataPath, 'r') as f:
-            lines = f.readlines()
-        self.names = [i for i in lines[::2]]
-        self.sequences = [i for i in lines[1::2]]
-        self.labels = [[k for j,k in zip(list(i.split(',')[0][1:]),labIndex) if j=='1'] for i in self.names]
-        self.sLens = [len(i) for i in tqdm(self.sequences)]
-    def __len__(self):
-        return len(self.sequences)
-    def __getitem__(self, index):
-        return {'name':self.names[index],
-                'sequence':self.sequences[index],
-                'sLen':self.sLens[index],
-                'label':self.labels[index]}

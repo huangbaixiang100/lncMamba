@@ -1,0 +1,166 @@
+from utils import *
+from DL_ClassifierModel import *
+from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold
+from functools import reduce
+import os
+import numpy as np
+import torch
+import subprocess
+
+
+def get_free_gpu():
+
+    result = subprocess.run(
+        ['nvidia-smi', '--query-gpu=index,memory.free', '--format=csv,nounits,noheader'],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+
+
+    gpu_info = result.stdout.splitlines()
+
+    gpu_memory = [(int(info.split(',')[0]), int(info.split(',')[1])) for info in gpu_info]
+    free_gpu = sorted(gpu_memory, key=lambda x: x[1], reverse=True)[0][0]
+    return free_gpu
+
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+seed = 388014
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
+
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+data_path = '/outputlncrna.csv'
+
+# Load dataset
+totalDS = lncRNA_loc_dataset(data_path, k=3, mode='csv')
+tokenizer = Tokenizer(totalDS.sequences, totalDS.labels, seqMaxLen=8196, sequences_=totalDS.sequences_)
+
+# Transform the binary label vector into decimal int and use it to do the stratified split
+tknedLabs = []
+for lab in totalDS.labels:
+    tmp = np.zeros((tokenizer.labNum))
+    tmp[[tokenizer.lab2id[i] for i in lab]] = 1
+    tknedLabs.append(reduce(lambda x, y: 2 * x + y, tmp) // 4)
+
+# Get the test set
+for i, j in StratifiedShuffleSplit(test_size=0.1, random_state=SEED).split(range(len(tknedLabs)), tknedLabs):
+    testIdx = j
+    break
+testIdx_ = set(testIdx)
+restIdx = np.array([i for i in range(len(totalDS)) if i not in testIdx_])
+
+# Cache the subsequence one-hot
+totalDS.cache_tokenizedKgpSeqArr(tokenizer, groups=512)
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)  # 5-fold cross-validation
+
+# Initialize a dictionary to store metrics for each fold
+cv_results = {
+    "LOSS": [],
+    "AvgF1": [],
+    "MiF": [],
+    "MaF": [],
+    "MaAUC": [],
+    "MiAUC": [],
+    "MiP": [],
+    "MaP": [],
+    "MiR": [],
+    "MaR": [],
+}
+
+# 5-fold cross-validation
+for i, (trainIdx, validIdx) in enumerate(skf.split(restIdx, np.array(tknedLabs)[restIdx])):
+    # Define save path dynamically within the loop
+    save_path = f'./models/'
+    if not os.path.exists(os.path.dirname(save_path)):
+        os.makedirs(os.path.dirname(save_path))
+
+    # Get the training set and validation set of fold i
+    trainIdx, validIdx = restIdx[trainIdx], restIdx[validIdx]
+    trainDS, validDS, testDS = (
+        torch.utils.data.Subset(totalDS, trainIdx),
+        torch.utils.data.Subset(totalDS, validIdx),
+        torch.utils.data.Subset(totalDS, testIdx),
+    )
+
+    # selecte model
+    backbone = KGPDPLAM_alpha_Mamba2(
+        tokenizer.labNum,
+        tknEmbedding=None,
+        tknNum=tokenizer.tknNum,
+        embSize=256,
+        dkEnhance=1,
+        freeze=False,
+        L=1,
+        H=256,
+        A=8,
+        maxRelativeDist=25,
+        embDropout=0.2,
+        hdnDropout=0.1,
+        paddingIdx=tokenizer.tkn2id['[PAD]'],
+        tokenizer=tokenizer,
+    ).to(device)
+
+    model = SequenceMultiLabelClassifier(backbone, collateFunc=PadAndTknizeCollateFunc(tokenizer), mode=0)
+
+    # Set the learning rate and weight decay
+    no_decay = ['bias', 'LayerNorm.weight']
+    optimizer_grouped_parameters = [
+        {
+            'params': [p for n, p in backbone.named_parameters() if not any(nd in n for nd in no_decay)],
+            'weight_decay': 0.001,
+        },
+        {
+            'params': [p for n, p in backbone.named_parameters() if any(nd in n for nd in no_decay)],
+            'weight_decay': 0.0,
+        },
+    ]
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=3e-4, weight_decay=0.001)
+
+    # Train the model for fold i
+    fold_results = model.train(
+        optimizer=optimizer,
+        trainDataSet=trainDS,
+        validDataSet=validDS,
+        otherDataSet=testDS,
+        batchSize=16,
+        epoch=128,
+        earlyStop=64,
+        saveRounds=1,
+        isHigherBetter=True,
+        metrics="MaAUC",
+        report=[
+            "LOSS", "AvgF1", 'MiF', 'MaF', "LOSS", "MaAUC", 'MiAUC', 'MiP', 'MaP', 'MiR', 'MaR', "EachAUC", "EachAUPR"
+        ],
+        savePath=save_path,
+        shuffle=True,
+        dataLoadNumWorkers=4,
+        pinMemory=True,
+        warmupEpochs=4,
+        doEvalTrain=False,
+        prefetchFactor=2,
+    )
+
+    # Append fold results to cv_results
+    for key in cv_results:
+        if key in fold_results:
+            cv_results[key].append(fold_results[key])
+
+# Calculate and print average metrics across all folds
+print("Cross-validation results:")
+for key, values in cv_results.items():
+    avg_value = np.mean(values)
+    print(f"{key}: {avg_value:.4f}")
+
+
+
+
+
+
+
+
+
+

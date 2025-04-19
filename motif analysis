@@ -1,0 +1,380 @@
+###The 5-fold cross-validation training was achieved, and the motif with the highest weight in the nucleotide sequence was statistically analyzed and visualized
+from utils import *
+import glob
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold
+from collections import defaultdict
+from utils import *
+from DL_ClassifierModel import *
+
+
+class_idx_to_name = {
+    0: "Nucleus",
+    1: "Cytoplasm",
+    2: "Chromatin",
+    3: "Insoluble Cytoplasm"
+}
+
+# Set random seed for reproducibility
+SEED = 388014
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
+# Check if GPU is available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Load and preprocess data
+totalDS = lncRNA_loc_dataset('/dataset/data.csv', k=3, mode='csv')
+tokenizer = Tokenizer(totalDS.sequences, totalDS.labels, seqMaxLen=8196, sequences_=totalDS.sequences_)
+
+# Convert labels to multi-hot encoding
+tknedLabs = []
+for lab in totalDS.labels:
+    tmp = np.zeros(tokenizer.labNum)
+    tmp[[tokenizer.lab2id[i] for i in lab]] = 1
+    tknedLabs.append(tmp)
+
+tknedLabs = np.array(tknedLabs)  # Shape: (num_samples, num_classes)
+
+# Use StratifiedShuffleSplit to split test set (10%) and remaining set (90%)
+sss = StratifiedShuffleSplit(n_splits=1, test_size=0.1, random_state=SEED)
+# Note: StratifiedShuffleSplit does not support multi-label, assuming single-label classification
+train_valid_idx, testIdx = next(sss.split(np.zeros(len(tknedLabs)), tknedLabs.argmax(axis=1)))
+restIdx = train_valid_idx
+testIdx = testIdx  # Test set indices
+
+# Cache one-hot encoded sequences for faster loading
+totalDS.cache_tokenizedKgpSeqArr(tokenizer, groups=512)
+
+# Initialize 5-fold stratified cross-validation
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+
+# Initialize dictionary to store cross-validation results
+cv_results = {
+    "LOSS": [], "AvgF1": [], "MiF": [], "MaF": [], "MaAUC": [], "MiAUC": [],
+    "MiP": [], "MaP": [], "MiR": [], "MaR": [],
+}
+
+# List to track saved model paths and their corresponding MaAUC
+model_save_info = []
+
+# Function to find the latest saved model for a given fold
+def find_latest_model_path(fold, base_dir='models'):
+    pattern = os.path.join(base_dir, f'KGPDPLAM_alpha_cv{fold}_best.pth_*')
+    matched_files = glob.glob(pattern)
+    if not matched_files:
+        raise FileNotFoundError(f"No model files found for fold {fold} with pattern {pattern}")
+    # Assume the latest file is the best model; adjust sorting logic if needed
+    return sorted(matched_files, key=os.path.getmtime)[-1]
+
+# 5-fold cross-validation training
+for fold, (trainIdx_fold, validIdx_fold) in enumerate(skf.split(restIdx, tknedLabs[restIdx].argmax(axis=1))):
+    print(f"Starting Fold {fold + 1}")
+    base_save_path = '/root/LncLocFormer/models'  # Base save path
+    os.makedirs(os.path.dirname(base_save_path), exist_ok=True)
+
+    # Get actual training and validation indices
+    trainIdx_actual, validIdx_actual = restIdx[trainIdx_fold], restIdx[validIdx_fold]
+    trainDS = torch.utils.data.Subset(totalDS, trainIdx_actual)
+    validDS = torch.utils.data.Subset(totalDS, validIdx_actual)
+    testDS = torch.utils.data.Subset(totalDS, testIdx)
+
+    # Initialize model
+    backbone =  KGPDPLAM_alpha_Mamba2(
+        tokenizer.labNum,
+        tknEmbedding=None,
+        tknNum=tokenizer.tknNum,
+        embSize=256,
+        dkEnhance=1,
+        freeze=False,
+        L=1,
+        H=256,
+        A=8,
+        maxRelativeDist=25,
+        embDropout=0.2,
+        hdnDropout=0.1,
+        paddingIdx=tokenizer.tkn2id['[PAD]'],
+        tokenizer=tokenizer,
+    ).to(device)  # Move backbone to GPU
+
+    # Initialize classifier model
+    model = SequenceMultiLabelClassifier(backbone, collateFunc=PadAndTknizeCollateFunc(tokenizer), mode=0)
+    # Manually move internal model to GPU
+    model.model = model.model.to(device)
+    # If there is a loss function (criterion), move it to GPU as well
+    if hasattr(model, 'criterion') and model.criterion is not None:
+        model.criterion = model.criterion.to(device)
+
+    # Set up optimizer with weight decay for specific parameters
+    no_decay = ['bias', 'LayerNorm.weight']
+    optimizer_grouped_parameters = [
+        {
+            'params': [p for n, p in backbone.named_parameters() if not any(nd in n for nd in no_decay)],
+            'weight_decay': 0.001,
+        },
+        {
+            'params': [p for n, p in backbone.named_parameters() if any(nd in n for nd in no_decay)],
+            'weight_decay': 0.0,
+        },
+    ]
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=3e-4, weight_decay=0.001)
+
+    # Train the model
+    fold_results = model.train(
+        optimizer=optimizer,
+        trainDataSet=trainDS,
+        validDataSet=validDS,
+        otherDataSet=testDS,
+        batchSize=32,
+        epoch=2,  # Reduced epochs for testing; adjust as needed
+        earlyStop=64,
+        saveRounds=1,
+        isHigherBetter=True,
+        metrics="MaAUC",
+        report=[
+            "LOSS", "AvgF1", 'MiF', 'MaF', "LOSS", "MaAUC", 'MiAUC',
+            'MiP', 'MaP', 'MiR', 'MaR', "EachAUC", "EachAUPR"
+        ],
+        savePath=base_save_path,  # Ensure saving to a consistent base path
+        shuffle=True,
+        dataLoadNumWorkers=4,
+        pinMemory=True,
+        warmupEpochs=4,
+        doEvalTrain=False,
+        prefetchFactor=2,
+    )
+
+    # Store fold results
+    for key in cv_results:
+        if key in fold_results:
+            cv_results[key].append(fold_results[key])
+
+    # Get current fold's MaAUC
+    ma_auc = fold_results.get("MaAUC", 0)
+
+    # Find the actual saved model file
+    matched_files = glob.glob(f'{base_save_path}*')
+    if not matched_files:
+        raise FileNotFoundError(f"No saved model found for fold {fold} with pattern '{base_save_path}*'")
+
+    # Assume the latest file is the best model
+    actual_save_path = max(matched_files, key=os.path.getmtime)
+    print(f"Fold {fold + 1} model saved to: {actual_save_path}")
+
+    # Record the actual saved path and MaAUC
+    model_save_info.append((actual_save_path, ma_auc))
+    print(f"Fold {fold + 1} completed with MaAUC: {ma_auc}\n")
+
+# After cross-validation, select the model with the highest MaAUC
+if not model_save_info:
+    raise ValueError("No models were saved during cross-validation.")
+
+# Select the model with the highest MaAUC
+best_model_info = max(model_save_info, key=lambda x: x[1])
+best_model_path, best_ma_auc = best_model_info
+print(f"Best model selected: {best_model_path} with MaAUC: {best_ma_auc}")
+
+# Confirm the best model file exists
+if not os.path.exists(best_model_path):
+    raise FileNotFoundError(f"Best model file not found: {best_model_path}")
+
+# Load the best backbone model
+best_backbone = KGPDPLAM_alpha_Mamba2(
+    tokenizer.labNum,
+    tknEmbedding=None,
+    tknNum=tokenizer.tknNum,
+    embSize=256,
+    dkEnhance=1,
+    freeze=False,
+    L=1,
+    H=256,
+    A=8,
+    maxRelativeDist=25,
+    embDropout=0.2,
+    hdnDropout=0.1,
+    paddingIdx=tokenizer.tkn2id['[PAD]'],
+    tokenizer=tokenizer,
+).to(device)
+
+# Load state dictionary into backbone
+checkpoint = torch.load(best_model_path, map_location=device)
+print("Checkpoint keys:", checkpoint.keys())
+
+if 'model' in checkpoint:
+    print("Keys in 'model':", checkpoint['model'].keys())
+    full_state_dict = checkpoint['model']
+    # Since the keys in 'model' are already the backbone's parameter names, no need to filter
+    backbone_state_dict = full_state_dict
+    print(f"Extracted backbone_state_dict with {len(backbone_state_dict)} keys.")
+else:
+    backbone_state_dict = checkpoint  # If state_dict was saved directly
+
+# Load state_dict into backbone
+try:
+    best_backbone.load_state_dict(backbone_state_dict, strict=True)
+    print("Successfully loaded backbone_state_dict with strict=True.")
+except RuntimeError as e:
+    print("RuntimeError during load_state_dict with strict=True:", e)
+    print("Attempting to load with strict=False.")
+    best_backbone.load_state_dict(backbone_state_dict, strict=False)
+    print("Loaded backbone_state_dict with strict=False.")
+
+# Create classifier model and assign the loaded backbone
+best_model = SequenceMultiLabelClassifier(best_backbone, collateFunc=PadAndTknizeCollateFunc(tokenizer), mode=0)
+# Manually move internal model to GPU
+best_model.model = best_model.model.to(device)
+# If there is a loss function (criterion), move it to GPU as well
+if hasattr(best_model, 'criterion') and best_model.criterion is not None:
+    best_model.criterion = best_model.criterion.to(device)
+
+# Set internal model to evaluation mode
+best_model.model.eval()
+print("Successfully set best_model.model to eval mode.")
+
+# **Analyze and Count Top Attention Regions for Each Class**
+
+# Initialize a dictionary to store top attention regions for each class
+class_attn_regions = defaultdict(list)
+allIdx = np.array([i for i in range(len(totalDS))])
+allDS = torch.utils.data.Subset(totalDS, allIdx)
+
+# Get number of classes
+num_classes = tokenizer.labNum
+print(f"Number of classes: {num_classes}")
+
+# Iterate through the entire dataset
+for idx in range(len(allDS)):
+    selected_data = allDS[idx]
+    inputs = selected_data['tokenizedKgpSeqArr'].unsqueeze(0).to(device)  # Add batch dimension and move to GPU
+
+    # Forward pass to get attention weights
+    with torch.no_grad():
+        output = best_model.model({'tokenizedKgpSeqArr': inputs})
+        attn_weights = output.get('attn_weights')
+
+    # Validate attention weights
+    if attn_weights is None or len(attn_weights) == 0:
+        raise ValueError("Model output does not contain valid 'attn_weights'. Please check the model's forward method.")
+
+    # Process attention weights
+    if isinstance(attn_weights, list):
+        attn_weights = attn_weights[0]  # Select the first layer
+    elif isinstance(attn_weights, torch.Tensor):
+        pass
+    else:
+        raise ValueError("Unexpected type for 'attn_weights'.")
+
+    # Confirm the shape of attn_weights
+    # Shape: (batch_size, emb_size, class_num)
+    if attn_weights.dim() == 3:
+        # Rearrange dimensions to (class_num, emb_size, batch_size)
+        attn_weights = attn_weights.permute(2, 1, 0)  # (class_num, emb_size, batch_size)
+        # Average over batch_size dimension to get (class_num, emb_size)
+        attn_weights = attn_weights.mean(dim=2).cpu().numpy()
+    else:
+        raise ValueError(f"Unexpected attention tensor shape: {attn_weights.shape}")
+
+    # Convert RNA sequence to token indices
+    rna_seq = inputs[0].cpu().numpy()  # Shape: (emb_size, num_tokens)
+    rna_seq = np.argmax(rna_seq, axis=-1)  # Convert to indices
+    rna_tokens = [tokenizer.id2tkn[idx] for idx in rna_seq]
+
+    # For each class, find the position with the highest attention and its neighboring tokens
+    for class_idx in range(num_classes):
+        class_attn = attn_weights[class_idx]  # Shape: (emb_size,)
+        max_idx = np.argmax(class_attn)  # Position with highest attention
+
+        # Define a window, e.g., the current position and one before and after
+        window_size = 1
+        start_idx = max(0, max_idx - window_size)
+        end_idx = min(len(rna_seq), max_idx + window_size + 1)
+        top_region = rna_tokens[start_idx:end_idx]
+
+        # Add each token in the window to the class's attention regions
+        for token in top_region:
+            class_attn_regions[class_idx].append(token)
+
+    # Optional: Display progress
+    if (idx + 1) % 100 == 0 or (idx + 1) == len(allDS):
+        print(f"Processed {idx + 1}/{len(allDS)} RNA sequences.")
+
+# Count the frequency of top attention regions for each class
+class_attn_counter = {}
+for class_idx in range(num_classes):
+    regions = class_attn_regions.get(class_idx, [])
+    counter = Counter(regions)
+    class_attn_counter[class_idx] = counter
+
+# Print the top attention regions and their frequencies for each class
+for class_idx in range(num_classes):
+    counter = class_attn_counter.get(class_idx, Counter())
+    class_name = class_idx_to_name.get(class_idx, f"Class {class_idx + 1}")
+    print(f"\n=== {class_name} ===")
+    if counter:
+        for region, freq in counter.most_common(10):  # Show top 10
+            print(f"Region: {region}, Frequency: {freq}")
+    else:
+        print("No attention regions found for this class.")
+
+
+
+def visualize_class_attention_frequencies(class_attn_counter, class_idx_to_name, save_dir, top_n=10):
+    """
+    Visualize the frequency of top attention regions for each class.
+
+    Parameters:
+    - class_attn_counter (dict): Counter for each class's attention regions.
+    - class_idx_to_name (dict): Mapping from class index to class name.
+    - save_dir (str): Directory to save the visualization.
+    - top_n (int): Number of top regions to display.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    plt.rcParams['axes.unicode_minus'] = False  # Fix for minus sign display
+
+    num_classes = len(class_idx_to_name)
+    cols = 2  # Two subplots per row
+    rows = (num_classes + 1) // cols  # Calculate the number of rows
+
+    fig, axs = plt.subplots(rows, cols, figsize=(20, 15))
+    axs = axs.flatten()  # Flatten to 1D array for easy iteration
+
+    for class_idx, ax in zip(range(num_classes), axs):
+        counter = class_attn_counter.get(class_idx, Counter())
+        most_common = counter.most_common(top_n)
+        class_name = class_idx_to_name.get(class_idx, f"Class {class_idx + 1}")
+
+        if not most_common:
+            ax.set_title(f"{class_name} Top Attention Regions")
+            ax.text(0.5, 0.5, "No Data", ha='center', va='center', fontsize=12)
+            ax.axis('off')
+            continue
+
+        regions, freqs = zip(*most_common)
+        sns.barplot(x=list(freqs), y=list(regions), palette="viridis", ax=ax)
+        ax.set_xlabel("Frequency")
+        ax.set_ylabel("Attention Region")
+        ax.set_title(f"Top {top_n} Attention Regions for {class_name}")
+
+    # Hide unused subplots
+    for ax in axs[num_classes:]:
+        ax.axis('off')
+
+    plt.tight_layout()
+    visualization_path = os.path.join(save_dir, "top_attention_regions_combined.png")
+    plt.savefig(visualization_path, dpi=300)
+    plt.close()
+    print(f"Attention regions frequency plot saved to: {visualization_path}")
+
+# Call the visualization function
+visualize_class_attention_frequencies(
+    class_attn_counter=class_attn_counter,
+    class_idx_to_name=class_idx_to_name,
+    save_dir='/root/autodl-tmp/LncLocFormer/models',
+    top_n=10
+)
