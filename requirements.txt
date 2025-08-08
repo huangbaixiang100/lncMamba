@@ -1,0 +1,23 @@
+# Core deep learning
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Array & data processing
+numpy>=1.23
+pandas>=1.5
+scikit-learn>=1.2
+
+# Visualization
+matplotlib>=3.7
+seaborn>=0.12
+
+# Training utilities
+tqdm>=4.64
+einops>=0.6
+pytorch-lamb>=1.0.0
+
+# Mamba SSM ops (require CUDA toolchain compatible with your PyTorch)
+causal-conv1d==1.0.0
+mamba-ssm==1.0.1
+
+

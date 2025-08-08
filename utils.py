@@ -89,7 +89,13 @@ class lncRNA_loc_dataset(Dataset):
             tmp = ['-'*(k//2)+i+'-'*(k//2) for i in data['Sequence']]
             self.sequences = [[i[j-k//2:j+k//2+1] for j in range(k//2,len(i)-k//2)] for i in tmp]
             self.sequences_ = [i for i in data['Sequence']]
-            self.labels = [i.split(';') for i in data['SubCellular_Localization'].tolist()]
+            # Try different possible column names for labels
+            if 'SubCellular_Localization' in data.columns:
+                self.labels = [i.split(';') for i in data['SubCellular_Localization'].tolist()]
+            elif 'Subcellular_Localization' in data.columns:
+                self.labels = [i.split(';') for i in data['Subcellular_Localization'].tolist()]
+            else:
+                raise ValueError("Label column not found. Expected 'SubCellular_Localization' or 'Subcellular_Localization'")
         elif mode=="fasta":
             with open(dataPath, 'r') as f:
                 tmp = f.readlines()

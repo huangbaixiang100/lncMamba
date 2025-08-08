@@ -1,11 +1,128 @@
+import numpy as np
+import pandas as pd
+import torch, time, os, pickle, random
+from torch import nn as nn
+from torch.nn import functional as F
 from nnLayer import *
 from metrics import *
+from collections.abc import Iterable
+from collections import Counter, OrderedDict
+from sklearn.model_selection import StratifiedKFold, KFold
+from torch.backends import cudnn
 from tqdm import tqdm
+from torchvision import models
+from pytorch_lamb import lamb
 from torch.utils.data import DataLoader, Dataset
 import torch.distributed
-import torch,time,os
-import numpy as np
 
+class MLP(nn.Module):
+    def __init__(self, inSize, outSize, hiddenList=[], dropout=0.0, bnEveryLayer=False, dpEveryLayer=False, inBn=False, outBn=False, outAct=False, outDp=False, name='MLP', actFunc=nn.ReLU):
+        super(MLP, self).__init__()
+        self.name = name
+        hiddens,bns = [],[]
+        if inBn:
+            self.startBN = nn.BatchNorm1d(inSize)
+        for i,os in enumerate(hiddenList):
+            hiddens.append( nn.Sequential(
+                nn.Linear(inSize, os),
+            ) )
+            bns.append(nn.BatchNorm1d(os))
+            inSize = os
+        bns.append(nn.BatchNorm1d(outSize))
+        self.actFunc = actFunc()
+        self.dropout = nn.Dropout(p=dropout)
+        self.hiddens = nn.ModuleList(hiddens)
+        self.bns = nn.ModuleList(bns)
+        self.out = nn.Linear(inSize, outSize)
+        self.bnEveryLayer = bnEveryLayer
+        self.dpEveryLayer = dpEveryLayer
+        self.inBn = inBn
+        self.outBn = outBn
+        self.outAct = outAct
+        self.outDp = outDp
+    def forward(self, x):
+        if self.inBn: x = self.startBN(x)
+        for h,bn in zip(self.hiddens,self.bns):
+            x = h(x)
+            if self.bnEveryLayer:
+                if len(x.shape)==3:
+                    x = bn(x.transpose(1,2)).transpose(1,2)
+                else:
+                    x = bn(x)
+            x = self.actFunc(x)
+            if self.dpEveryLayer:
+                x = self.dropout(x)
+        x = self.out(x)
+        if self.outBn: x = self.bns[-1](x)
+        if self.outAct: x = self.actFunc(x)
+        if self.outDp: x = self.dropout(x)
+        return x
+
+# Adversarial training
+class FGM():
+    def __init__(self, model, emb_name='emb'):
+        self.model = model
+        self.emb_name = emb_name
+        self.backup = {}
+
+    def attack(self, epsilon=1.):
+        # Note: emb_name should match the embedding parameter name in your model
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and self.emb_name in name:
+                self.backup[name] = param.data.clone()
+                norm = torch.norm(param.grad)
+                if norm != 0:
+                    r_at = epsilon * param.grad / norm
+                    param.data.add_(r_at)
+
+    def restore(self):
+        # Note: emb_name should match the embedding parameter name in your model
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and self.emb_name in name:
+                assert name in self.backup
+                param.data = self.backup[name]
+        self.backup = {}
+
+
+class EMA():
+    def __init__(self, model, decay):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+
+    def register(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                new_average = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
+                self.shadow[name] = new_average.clone()
+
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                self.backup[name] = param.data
+                param.data = self.shadow[name]
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.backup
+                param.data = self.backup[name]
+        self.backup = {}
+
+
+def dict_to_device(data, device):
+    for k in data:
+        if data[k] is not None:
+            data[k] = data[k].to(device)
+    return data
 
 
 class BaseClassifier:
@@ -112,7 +229,6 @@ class BaseClassifier:
                                     print(f'Bingo!!! Get a better Model with val {metrics}: {mtc:.3f}!!!')
                                     bestMtc = mtc
                                     self.save("%s.pkl" % savePath, e + 1, bestMtc)
-
                                 stopSteps = 0
                             else:
                                 stopSteps += 1
@@ -132,12 +248,14 @@ class BaseClassifier:
                 ema.restore()
         if (self.mode > 0 and torch.distributed.get_rank() == 0) or self.mode == 0:
             with torch.no_grad():
-                new_path = "%s_%s.pkl" % (savePath, ("%.3lf" % bestMtc)[2:])
-               # os.rename("%s.pkl" % savePath, new_path)
-               # self.load(new_path)  # 使用新路径加载
-                self.load(savePath)
+                model_path = "%s.pkl" % savePath
+                if os.path.exists(model_path):
+                    self.load(model_path)
+                else:
+                    print(f"Warning: model file {model_path} not found, using current model weights")
+                    self.save(model_path, epoch, bestMtc)  # save current model
                 self.to_eval_mode()
-            #    os.rename("%s.pkl" % savePath, "%s_%s.pkl" % (savePath, ("%.3lf" % bestMtc)[2:]))
+                os.rename("%s.pkl" % savePath, "%s_%s.pkl" % (savePath, ("%.3lf" % bestMtc)[2:]))
                 print(f'============ Result ============')
                 print(f'[Total Train]', end='')
                 # res = self.calculate_metrics_by_iterator(ds, metrictor, ignoreIdx, report)
@@ -145,19 +263,24 @@ class BaseClassifier:
                 data = self.calculate_y_prob_by_iterator(evalTrainStream)
                 metrictor.set_data(data)
                 metrictor(report)
-                print(f'[Total Valid]', end='')
-                # res = self.calculate_metrics_by_iterator(ds, metrictor, ignoreIdx, report)
-                # metrictor.show_res(res)
-                data = self.calculate_y_prob_by_iterator(validStream)
-                metrictor.set_data(data)
-                res = metrictor(report)
+                res = {}  # initialize result dict
+                if validDataSet is not None:
+                    print(f'[Total Valid]', end='')
+                    # res = self.calculate_metrics_by_iterator(ds, metrictor, ignoreIdx, report)
+                    # metrictor.show_res(res)
+                    data = self.calculate_y_prob_by_iterator(validStream)
+                    metrictor.set_data(data)
+                    res = metrictor(report)
                 if otherDataSet is not None:
                     print(f'[Total Other]', end='')
                     # res = self.calculate_metrics_by_iterator(ds, metrictor, ignoreIdx, report)
                     # metrictor.show_res(res)
                     data = self.calculate_y_prob_by_iterator(otherStream)
                     metrictor.set_data(data)
-                    metrictor(report)
+                    other_res = metrictor(report)
+                    # If no validation set, use test results as primary
+                    if validDataSet is None:
+                        res = other_res
                 # metrictor.each_class_indictor_show(dataClass.id2lab)
                 print(f'================================')
                 return res
@@ -186,35 +309,18 @@ class BaseClassifier:
         return loss
 
     def save(self, path, epochs, bestMtc=None):
-        # 确保路径正确，如果没有以 .pkl 结尾，则添加 .pkl 后缀
-        if not path.endswith('.pkl'):
-            path = path + '.pkl'  # 确保路径是以 .pkl 结尾
         stateDict = {'epochs': epochs, 'bestMtc': bestMtc, 'model': self.model.state_dict()}
         torch.save(stateDict, path)
-        print(f'Model saved in "{path}".')
+        print('Model saved in "%s".' % path)
 
     def load(self, path, map_location=None):
-        # 获取文件夹中的所有 .pkl 文件
-        pkl_files = [f for f in os.listdir(path) if f.endswith('.pkl')]
-
-        # 如果没有找到 .pkl 文件，抛出异常
-        if not pkl_files:
-            raise FileNotFoundError("No .pkl files found in the provided directory.")
-
-        # 获取文件路径以及对应的修改时间
-        pkl_files_with_time = [(f, os.path.getmtime(os.path.join(path, f))) for f in pkl_files]
-
-        # 找到修改时间最新的文件
-        latest_file = max(pkl_files_with_time, key=lambda x: x[1])[0]
-
-        # 构造最新文件的完整路径
-        latest_file_path = os.path.join(path, latest_file)
-
-        # 加载最新权重
-        parameters = torch.load(latest_file_path, map_location=map_location)
-        self.model.load_state_dict(parameters['model'])
-
+        parameters = torch.load(path, map_location=map_location)
+        if self.mode == 0:
+            self.model.load_state_dict(parameters['model'])
+        else:
+            self.model.module.load_state_dict(parameters['model'])
         print("%d epochs and %.3lf val Score 's model load finished." % (parameters['epochs'], parameters['bestMtc']))
+
 
 class PadAndTknizeCollateFunc:
     def __init__(self, tokenizer, maskProb=0.15, groups=-1, duplicate=False, randomSample=False, dataEnhance=False,
@@ -235,7 +341,7 @@ class PadAndTknizeCollateFunc:
             tokenizedKgpSeqArr = torch.cat([i['tokenizedKgpSeqArr'].unsqueeze(0) for i in data], dim=0)
             tokenizedSeqArr, maskPAD, posIdxArr = None, None, None
         elif self.groups > -1:
-            if self.randomSample and self.train and random.random() < 0.2:  # 随机丢失15的核苷酸
+            if self.randomSample and self.train and random.random() < 0.2:  # randomly drop ~15% nucleotides
                 tmp = [[j for j in i if random.random() > 0.15] for i in tmp]
             tokenizedKgpSeqArr = torch.tensor(self.tokenizer.tokenize_sentences_to_k_group(tmp, self.groups),
                                               dtype=torch.float32)
@@ -273,11 +379,11 @@ class PadAndTknizeCollateFunc:
 
             seqLens = torch.tensor([min(i['sLen'], self.tokenizer.seqMaxLen) for i in data], dtype=torch.int32)
             if self.dataEnhance:
-                for i in range(len(tokenizedSeqArr)):  # 数据增强
-                    if random.random() < self.dataEnhanceRatio / 2:  # 随机排列
+                for i in range(len(tokenizedSeqArr)):  # data augmentation
+                    if random.random() < self.dataEnhanceRatio / 2:  # random permutation
                         tokenizedSeqArr[i][:seqLens[i]] = tokenizedSeqArr[i][:seqLens[i]][
                             np.random.permutation(int(seqLens[i]))]
-                    if random.random() < self.dataEnhanceRatio:  # 逆置
+                    if random.random() < self.dataEnhanceRatio:  # reverse order
                         tokenizedSeqArr[i][:seqLens[i]] = tokenizedSeqArr[i][:seqLens[i]][range(int(seqLens[i]))[::-1]]
 
         tmp = self.tokenizer.tokenize_labels([i['label'] for i in data])
@@ -358,8 +464,6 @@ class SequenceClassifier(BaseClassifier):
         optimizer.step()
         return loss
 
-
-
     def save(self, path, epochs, bestMtc=None):
         if self.mode == 0:
             model = self.model.state_dict()
@@ -370,27 +474,13 @@ class SequenceClassifier(BaseClassifier):
         print('Model saved in "%s".' % path)
 
     def load(self, path, map_location=None):
-        # 获取文件夹中的所有 .pkl 文件
-        pkl_files = [f for f in os.listdir(path) if f.endswith('.pkl')]
-
-        # 如果没有找到 .pkl 文件，抛出异常
-        if not pkl_files:
-            raise FileNotFoundError("No .pkl files found in the provided directory.")
-
-        # 获取文件路径以及对应的修改时间
-        pkl_files_with_time = [(f, os.path.getmtime(os.path.join(path, f))) for f in pkl_files]
-
-        # 找到修改时间最新的文件
-        latest_file = max(pkl_files_with_time, key=lambda x: x[1])[0]
-
-        # 构造最新文件的完整路径
-        latest_file_path = os.path.join(path, latest_file)
-
-        # 加载最新权重
-        parameters = torch.load(latest_file_path, map_location=map_location)
-        self.model.load_state_dict(parameters['model'])
-
+        parameters = torch.load(path, map_location=map_location)
+        if self.mode == 0:
+            self.model.load_state_dict(parameters['model'])
+        else:
+            self.model.module.load_state_dict(parameters['model'])
         print("%d epochs and %.3lf val Score 's model load finished." % (parameters['epochs'], parameters['bestMtc']))
+
 
 class SequenceMultiLabelClassifier(SequenceClassifier):
     def __init__(self, model, collateFunc=None, mode=0, criterion=None):
@@ -411,10 +501,12 @@ class SequenceMultiLabelClassifier(SequenceClassifier):
 
 
 # Copyright (c) 2024, Tri Dao, Albert Gu.
+
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from einops import rearrange, repeat
 
 try:
@@ -611,28 +703,28 @@ class Mamba2Simple(nn.Module):
 
 
 def contains_sequences(tokenized_seq, tokenizer, sequences=["TTT"]):
+    """Check whether tokenized_seq contains any of the given sequences.
+    :param tokenized_seq: input sequence (tokenized ids)
+    :param tokenizer: tokenizer with tkn2id
+    :param sequences: list of sequences to check
+    :return: bool indicating whether any sequence is present
     """
-   Detect whether the sequence contains the specified list of sequences
-  param tokenized_seq: The input sequence (tokenized)
-  param sequences: The list of sequences to be detected
-  return: Boolean value, indicating whether any of the specified sequences is included
-    """
-
+    # Ensure each sequence exists in tokenizer.tkn2id
     for seq in sequences:
         if seq not in tokenizer.tkn2id:
-            tokenizer.tkn2id[seq] = len(tokenizer.tkn2id)
+            tokenizer.tkn2id[seq] = len(tokenizer.tkn2id)  # assign new token id
 
-
+    # Collect token ids
     seq_ids = [tokenizer.tkn2id[seq] for seq in sequences]
 
-    #Check whether tokenized_seq contains any of the specified sequence ids
+    # Check presence
     for seq_id in seq_ids:
         if seq_id in tokenized_seq:
-            return True
+            return True  # found
 
-    return False
+    return False  # not found
 
-
+# Our proposed model: FPN-like + Mamba2 layers + improved attention module
 class KGPDPLAM_alpha_Mamba2(nn.Module):
     def __init__(self, classNum, tknEmbedding=None, tknNum=None,
                  embSize=64, dkEnhance=1, freeze=False,
@@ -652,18 +744,25 @@ class KGPDPLAM_alpha_Mamba2(nn.Module):
         self.conv2 = nn.Conv1d(in_channels=128, out_channels=64, kernel_size=5, padding=2)
         self.dropout3 = nn.Dropout(p=embDropout)
 
-
+        # Define stacked Mamba2Simple layers
         self.layers = nn.ModuleList([
             nn.ModuleDict({
                 'mamba': Mamba2Simple(
                     d_model=embSize,
-                    d_state=128,
+                    d_state=128,    # can also be 16
                     d_conv=4,
                     expand=2,
-                    headdim=256,
+                    headdim=64,
                     activation="swish",
                 ),
-                'dropout': nn.Dropout(p=0.1),
+                'ffn': nn.Sequential(
+                    nn.Linear(embSize, embSize * 4),
+                    nn.ReLU(),
+                    nn.Dropout(p=0.15),
+                    nn.Linear(embSize * 4, embSize),
+                    nn.Dropout(p=0.15)
+                ),
+                'dropout': nn.Dropout(p=0.15),
                 'ln': nn.LayerNorm(embSize)
 
             }) for _ in range(L)
@@ -674,16 +773,15 @@ class KGPDPLAM_alpha_Mamba2(nn.Module):
         )
         self.fcLinear = MLP(embSize, 1)
 
-
+        # Save tokenizer as class attribute
         self.tokenizer = tokenizer
 
-
     def forward(self, data):
-
+        # Embedding layer
         x = data['tokenizedKgpSeqArr'] @ self.embedding.weight  # => batchSize × seqLen × embSize
         x = self.dropout1(x)
 
-
+        # Feature extraction, FPN-like
         x1 = self.conv1(x)
         x1 = self.dropout2(x1)
 
@@ -692,22 +790,434 @@ class KGPDPLAM_alpha_Mamba2(nn.Module):
 
         x = torch.cat((x, x1, x2), dim=1)
 
+
         for layer in self.layers:
 
-            x = layer['mamba'](x)
+            x = layer['mamba'](x)  # Mamba layer output
 
             x = layer['dropout'](x)
-            x = layer['ln'](x)
-        pVec = torch.mean(x, dim=1)
+            x = layer['ln'](x)  # LayerNorm
+        pVec = torch.mean(x, dim=1)  # => batchSize × embSize
         pVec = pVec / torch.sqrt(torch.sum(pVec ** 2, dim=1, keepdim=True))
-        # # improvedDeepPseudoLabelwiseAttention
-        x, attn = self.improved_deepPseudoLabelwiseAttn(x)
-
-        x = self.fcLinear(x).squeeze(dim=2)
+        # DeepPseudoLabelwiseAttention
+        x, attn = self.improved_deepPseudoLabelwiseAttn(x)  # => batchSize × classNum × embSize
+        x = self.fcLinear(x).squeeze(dim=2)  # => batchSize × classNum
         return {'y_logit': x, 'p_vector': pVec, 'attn_weights': attn}
 
 
 
 
+class KGPDPLAM_alpha_transformer(nn.Module):
+    def __init__(self, classNum, tknEmbedding=None, tknNum=None,
+                 embSize=64, dkEnhance=1, freeze=False,
+                 L=4, H=256, A=4, maxRelativeDist=7,
+                 embDropout=0.2, hdnDropout=0.15, paddingIdx=-100):
+        super(KGPDPLAM_alpha_transformer, self).__init__()
+        self.embedding = nn.Embedding.from_pretrained(tknEmbedding,
+                                                      freeze=freeze) if tknEmbedding is not None else nn.Embedding(
+            tknNum, embSize, padding_idx=paddingIdx)
+        self.dropout1 = nn.Dropout(p=embDropout)
+
+        self.conv1 = nn.Conv1d(in_channels=512, out_channels=128, kernel_size=3, padding=1)
+        self.dropout2 = nn.Dropout(p=embDropout)
+
+        self.conv2 = nn.Conv1d(in_channels=128, out_channels=64, kernel_size=5, padding=2)
+        self.dropout3 = nn.Dropout(p=embDropout)
+
+        self.backbone = TransformerLayers_Realformer(L,
+                                                     feaSize=embSize if tknEmbedding is None else tknEmbedding.shape[1],
+                                                     dk=H // A, multiNum=A, maxRelativeDist=maxRelativeDist,
+                                                     hdnDropout=0.1, dkEnhance=dkEnhance)
+        self.deepPseudoLabelwiseAttn = DeepPseudoLabelwiseAttention(
+            embSize, classNum, L=-1, hdnDropout=hdnDropout, dkEnhance=1
+        )
+        self.fcLinear = MLP(embSize, 1)
+
+    def forward(self, data):
+        x = data['tokenizedKgpSeqArr'] @ self.embedding.weight  # => batchSize × seqLen × embSize
+        x = self.dropout1(x)
+
+        # x1 = self.conv1(x)
+        # x1 = self.dropout2(x1)
+
+        # x2 = self.conv2(x1)
+        # x2 = self.dropout3(x2)
+        # x = torch.cat((x, x1, x2), dim=1)
+
+        x, _, _, _, _, _ = self.backbone(x, None, None)  # => batchSize × seqLen × embSize
+        pVec = torch.mean(x, dim=1)  # => batchSize × embSize
+        pVec = pVec / torch.sqrt(torch.sum(pVec ** 2, dim=1, keepdim=True))
+        x, attn = self.deepPseudoLabelwiseAttn(x)  # => batchSize × classNum × embSize
+        x = self.fcLinear(x).squeeze(dim=2)  # => batchSize × classNum
+
+        return {'y_logit': x, 'p_vector': pVec, 'attn': attn}
 
 
+class MultiLabelSoftMarginLossWithContrastLearning(nn.Module):
+    def __init__(self, gama=0.2, alpha=0.1, margin=1.0):
+        super(MultiLabelSoftMarginLossWithContrastLearning, self).__init__()
+        self.gama = gama
+        self.alpha = alpha
+        self.margin = margin
+        self.loss_fn = nn.BCEWithLogitsLoss()  # loss for multi-label classification
+
+    def forward(self, pVec, Y_logit, Y):
+        # Classification loss (binary cross-entropy)
+        classification_loss = self.loss_fn(Y_logit, Y)
+
+        # Contrastive loss via cosine similarity between samples
+        # pVec is the embedding vector
+        pVec_norm = F.normalize(pVec, p=2, dim=1)  # L2 normalization
+
+        # Cosine similarity matrix: (batch_size, batch_size)
+        cosine_sim = torch.matmul(pVec_norm, pVec_norm.T)
+
+        # Positive/negative masks from labels
+        labels = Y.float()
+        positive_mask = labels.unsqueeze(1) * labels.unsqueeze(0)
+        negative_mask = 1 - positive_mask
+
+        # Contrastive components (matrix ops with shape (batch, batch))
+        positive_sim = cosine_sim * positive_mask
+        negative_sim = (self.margin - cosine_sim) * negative_mask
+
+        # Contrastive loss encourages larger positive similarity and smaller negative similarity
+        contrastive_loss = torch.sum(positive_sim) + torch.sum(torch.relu(negative_sim))
+
+        # Total loss = classification + contrastive
+        total_loss = classification_loss + self.alpha * contrastive_loss
+
+        return total_loss
+
+
+class SequenceMultiLabelClassifierWithContrastLearning(SequenceMultiLabelClassifier):
+    def __init__(self, model, gama=0.2, alpha=0.1, collateFunc=None, mode=0):
+        self.model = model
+        self.collateFunc = collateFunc
+        self.criterion = MultiLabelSoftMarginLossWithContrastLearning(gama, alpha)
+        self.mode = mode
+        if mode == 2:
+            self.scaler = torch.cuda.amp.GradScaler()
+        elif mode == 3:
+            import apex
+
+    def calculate_y_prob_by_iterator(self, dataStream):
+        device = next(self.model.parameters()).device
+        YArr, Y_preArr = [], []
+        vecArr, famArr = [], []
+        for data in tqdm(dataStream):
+            data = dict_to_device(data, device=device)
+            tmp = self.calculate_y_logit(data)
+            Y_pre, Y = F.sigmoid(tmp['y_logit']).detach().cpu().data.numpy().astype('float32'), data[
+                'tokenizedLabArr'].detach().cpu().data.numpy().astype('int32')
+            YArr.append(Y)
+            Y_preArr.append(Y_pre)
+
+            vec = tmp['p_vector'].detach().cpu().data.numpy().astype('float32')
+            vecArr.append(vec)
+
+        YArr, Y_preArr = np.vstack(YArr).astype('int32'), np.vstack(Y_preArr).astype('float32')
+        vecArr = np.vstack(vecArr).astype('float32')
+        return {'y_prob': Y_preArr, 'y_true': YArr, 'p_vector': vecArr}
+
+    def calculate_loss(self, data):
+        out = self.calculate_y_logit(data)
+        pVec = out['p_vector']
+        Y = data['tokenizedLabArr']
+        Y_logit = out['y_logit'].reshape(len(Y), -1)
+        return self.criterion(pVec, Y_logit, Y)
+
+
+
+class KGPM_alpha(nn.Module):
+    def __init__(self, classNum, tknEmbedding=None, tknNum=None,
+                 embSize=64, dkEnhance=1, freeze=False,
+                 L=4, H=256, A=4, maxRelativeDist=7,
+                 embDropout=0.2, hdnDropout=0.15, paddingIdx=-100):
+        super(KGPM_alpha, self).__init__()
+        self.embedding = nn.Embedding.from_pretrained(tknEmbedding,
+                                                      freeze=freeze) if tknEmbedding is not None else nn.Embedding(
+            tknNum, embSize, padding_idx=paddingIdx)
+        self.dropout = nn.Dropout(p=embDropout)
+
+        self.backbone = TransformerLayers_Realformer(L,
+                                                     feaSize=embSize if tknEmbedding is None else tknEmbedding.shape[1],
+                                                     dk=H // A, multiNum=A, maxRelativeDist=maxRelativeDist,
+                                                     hdnDropout=0.1, dkEnhance=dkEnhance)
+        self.fcLinear = MLP(embSize, classNum)
+
+    def forward(self, data):
+        x = data['tokenizedKgpSeqArr'] @ self.embedding.weight  # => batchSize × seqLen × embSize
+        x = self.dropout(x)
+        x, _, _, _, _, _ = self.backbone(x, None, None)  # => batchSize × seqLen × embSize
+        pVec = torch.mean(x, dim=1)  # => batchSize × embSize
+        pVec = pVec / torch.sqrt(torch.sum(pVec ** 2, dim=1, keepdim=True))
+        x, _ = torch.max(x, dim=1)  # => batchSize × embSize
+        x = self.fcLinear(x)  # => batchSize × classNum
+
+        return {'y_logit': x, 'p_vector': pVec}
+
+
+class CNN(nn.Module):
+    def __init__(self, classNum, tknEmbedding=None, tknNum=None,
+                 embSize=64, hdnSize=64, contextSizeList=[1, 3, 5], freeze=False,
+                 embDropout=0.2, hdnDropout=0.15, paddingIdx=-100):
+        super(CNN, self).__init__()
+        self.embedding = nn.Embedding.from_pretrained(tknEmbedding,
+                                                      freeze=freeze) if tknEmbedding is not None else nn.Embedding(
+            tknNum, embSize, padding_idx=paddingIdx)
+        self.dropout = nn.Dropout(p=embDropout)
+        self.cnn = TextCNN(embSize if tknEmbedding is None else tknEmbedding.shape[1], hdnSize, contextSizeList,
+                           reduction='pool', ln=True, actFunc=nn.ReLU, name='textCNN')
+        self.fcLinear = MLP(hdnSize * len(contextSizeList), classNum)
+
+    def forward(self, data):
+        x = self.embedding(data['tokenizedSeqArr'])  # => batchSize × seqLen × embSize
+        x = self.dropout(x)
+        x = self.cnn(x)
+        x = self.fcLinear(x)
+        return {'y_logit': x}
+
+
+class RNN(nn.Module):
+    def __init__(self, classNum, tknEmbedding=None, tknNum=None,
+                 embSize=64, hdnSize=64, freeze=False,
+                 embDropout=0.2, hdnDropout=0.15, paddingIdx=-100):
+        super(RNN, self).__init__()
+        self.embedding = nn.Embedding.from_pretrained(tknEmbedding,
+                                                      freeze=freeze) if tknEmbedding is not None else nn.Embedding(
+            tknNum, embSize, padding_idx=paddingIdx)
+        self.dropout = nn.Dropout(p=embDropout)
+        self.lstm = TextLSTM(embSize if tknEmbedding is None else tknEmbedding.shape[1], hdnSize, num_layers=1, ln=True)
+        self.fcLinear = MLP(hdnSize * 2, classNum)
+
+    def forward(self, data):
+        x = self.embedding(data['tokenizedSeqArr'])  # => batchSize × seqLen × embSize
+        x = self.dropout(x)
+        x = self.lstm(x)
+        x, _ = torch.max(x, dim=1)
+        x = self.fcLinear(x)
+        return {'y_logit': x}
+
+
+class FastText(nn.Module):
+    def __init__(self, classNum, tknEmbedding=None, tknNum=None,
+                 embSize=64, freeze=False,
+                 embDropout=0.2, paddingIdx=-100):
+        super(FastText, self).__init__()
+        self.embedding = nn.Embedding.from_pretrained(tknEmbedding,
+                                                      freeze=freeze) if tknEmbedding is not None else nn.Embedding(
+            tknNum, embSize, padding_idx=paddingIdx)
+        self.dropout = nn.Dropout(p=embDropout)
+        self.fcLinear = MLP(embSize, classNum)
+
+    def forward(self, data):
+        x = self.embedding(data['tokenizedSeqArr'])
+        x = self.dropout(x)
+        x, _ = torch.max(x, dim=1)
+        x = self.fcLinear(x)
+        return {'y_logit': x}
+
+
+class BPNN(nn.Module):
+    def __init__(self, classNum, inSize, hdnList=[128], dropout=0.2):
+        super(BPNN, self).__init__()
+        self.fcLinear = MLP(inSize, classNum, hiddenList=hdnList, dropout=dropout, inBn=True, dpEveryLayer=True)
+
+    def forward(self, data):
+        x = self.fcLinear(data['aacFea'])
+        return {'y_logit': x}
+
+# ================== 缺失的类定义 ==================
+
+def truncated_normal_(tensor,mean=0,std=0.09):
+    with torch.no_grad():
+        size = tensor.shape
+        tmp = tensor.new_empty(size+(4,)).normal_()
+        valid = (tmp < 2) & (tmp > -2)
+        ind = valid.max(-1, keepdim=True)[1]
+        tensor.data.copy_(tmp.gather(-1, ind).squeeze(-1))
+        tensor.data.mul_(std).add_(mean)
+        return tensor
+
+class SelfAttention_Realformer(nn.Module):
+    def __init__(self, feaSize, dk, multiNum, maxRelativeDist=7, dkEnhance=1, dropout=0.1, name='selfAttn'):
+        super(SelfAttention_Realformer, self).__init__()
+        self.dk = dk
+        self.multiNum = multiNum
+        self.WQ = nn.Linear(feaSize, dkEnhance*self.dk*multiNum)
+        self.WK = nn.Linear(feaSize, dkEnhance*self.dk*multiNum)
+        self.WV = nn.Linear(feaSize, self.dk*multiNum)
+        self.WO = nn.Linear(self.dk*multiNum, feaSize)
+        self.dropout = nn.Dropout(p=dropout)
+        if maxRelativeDist>0:
+            self.relativePosEmbK = nn.Embedding(2*maxRelativeDist+1, multiNum)
+            self.relativePosEmbB = nn.Embedding(2*maxRelativeDist+1, multiNum)
+        self.maxRelativeDist = maxRelativeDist
+        self.dkEnhance = dkEnhance
+        self.name = name
+    def forward(self, qx, kx, vx, preScores=None, maskPAD=None, posIdx=None):
+        # x: batchSize × seqLen × feaSize; maskPAD: batchSize × seqLen × seqLen; posIdx: batchSize × seqLen
+        B,L,C = qx.shape
+
+        queries = self.WQ(qx).reshape(B,L,self.multiNum,self.dk*self.dkEnhance).transpose(1,2) # => batchSize × multiNum × seqLen × dk
+        keys    = self.WK(kx).reshape(B,L,self.multiNum,self.dk*self.dkEnhance).transpose(1,2) # => batchSize × multiNum × seqLen × dk
+        values  = self.WV(vx).reshape(B,L,self.multiNum,self.dk).transpose(1,2) # => batchSize × multiNum × seqLen × dk
+        
+        scores = queries@keys.transpose(-1,-2) / np.sqrt(self.dk) # => batchSize × multiNum × seqLen × seqLen
+        
+        # relative position embedding
+        if self.maxRelativeDist>0:
+            if posIdx is None:
+                relativePosTab = torch.abs(torch.arange(0,L).reshape(1,-1,1) - torch.arange(0,L).reshape(1,1,-1)).float() # 1 × L × L
+            else:
+                relativePosTab = torch.abs(posIdx.reshape(B,L,1) - posIdx.reshape(B,1,L)).float() # B × L × L
+            relativePosTab[relativePosTab>self.maxRelativeDist] = self.maxRelativeDist+torch.log2(relativePosTab[relativePosTab>self.maxRelativeDist]-self.maxRelativeDist).float()
+            relativePosTab = torch.clip(relativePosTab,min=0,max=self.maxRelativeDist*2).long().to(qx.device)
+            scores = scores * self.relativePosEmbK(relativePosTab).transpose(1,-1).reshape(-1,self.multiNum,L,L) + self.relativePosEmbB(relativePosTab).transpose(1,-1).reshape(-1,self.multiNum,L,L)
+
+        # residual attention
+        if preScores is not None:
+            scores = scores + preScores
+
+        if maskPAD is not None:
+            #scores = scores*maskPAD.unsqueeze(dim=1)
+            scores = scores.masked_fill((maskPAD==0).unsqueeze(dim=1), -2**32+1) # -np.inf
+
+        alpha = self.dropout(F.softmax(scores, dim=3))
+
+        z = alpha @ values # => batchSize × multiNum × seqLen × dk
+        z = z.transpose(1,2).reshape(B,L,-1) # => batchSize × seqLen × multiNum*dk
+
+        z = self.WO(z) # => batchSize × seqLen × feaSize
+        return z,scores
+
+class FFN_Realformer(nn.Module):
+    def __init__(self, feaSize, dropout=0.1, actFunc=nn.GELU, name='FFN'):
+        super(FFN_Realformer, self).__init__()
+        self.layerNorm1 = nn.LayerNorm([feaSize])
+        self.layerNorm2 = nn.LayerNorm([feaSize])
+        self.Wffn = nn.Sequential(
+                        nn.Linear(feaSize, feaSize*4), 
+                        actFunc(),
+                        nn.Linear(feaSize*4, feaSize)
+                    )
+        self.dropout = nn.Dropout(p=dropout)
+        self.name = name
+    def forward(self, x, z):
+        z = self.layerNorm1(x + self.dropout(z)) # => batchSize × seqLen × feaSize
+
+        ffnx = self.Wffn(z) # => batchSize × seqLen × feaSize
+        return self.layerNorm2(z+self.dropout(ffnx)) # => batchSize × seqLen × feaSize
+    
+class Transformer_Realformer(nn.Module):
+    def __init__(self, feaSize, dk, multiNum, maxRelativeDist=7, dropout=0.1, dkEnhance=1, actFunc=nn.GELU):
+        super(Transformer_Realformer, self).__init__()
+        self.selfAttn = SelfAttention_Realformer(feaSize, dk, multiNum, maxRelativeDist, dkEnhance, dropout)
+        self.ffn = FFN_Realformer(feaSize, dropout, actFunc)
+        self._reset_parameters()
+
+    def forward(self, input):
+        qx,kx,vx,preScores,maskPAD,posIdx = input
+        # x: batchSize × seqLen × feaSize; xlen: batchSize
+        z,preScores = self.selfAttn(qx,kx,vx,preScores,maskPAD,posIdx) # => batchSize × seqLen × feaSize
+        x = self.ffn(vx, z)
+        return (x, x, x, preScores,maskPAD,posIdx) # => batchSize × seqLen × feaSize
+
+    def _reset_parameters(self):
+        r"""Initiate parameters in the transformer model."""
+        for name,p in self.named_parameters():
+            if 'weight' in name and len(p.shape) > 1:
+                p.data = truncated_normal_(p.data, std=0.02)
+            elif 'bias' in name:
+                p.data.fill_(0)
+
+class TransformerLayers_Realformer(nn.Module):
+    def __init__(self, layersNum, feaSize, dk, multiNum, maxRelativeDist=7, hdnDropout=0.1, dkEnhance=1, 
+                 actFunc=nn.GELU, name='textTransformer'):
+        super(TransformerLayers_Realformer, self).__init__()
+        self.transformerLayers = nn.Sequential(
+                                     OrderedDict(
+                                         [('transformer%d'%i, Transformer_Realformer(feaSize, dk, multiNum, maxRelativeDist, hdnDropout, dkEnhance, actFunc)) for i in range(layersNum)]
+                                     )
+                                 )
+        self.name = name
+    def forward(self, x, maskPAD, posIdx):
+        # x: batchSize × seqLen × feaSize; 
+        qx,kx,vx,scores,maxPAD,posIdx = self.transformerLayers((x, x, x, None, maskPAD, posIdx))
+        return (qx,kx,vx,scores,maxPAD,posIdx)# => batchSize × seqLen × feaSize
+
+class DeepPseudoLabelwiseAttention(nn.Module):
+    def __init__(self, inSize, classNum, L=1, M=64, hdnDropout=0.1, actFunc=nn.ReLU, dkEnhance=4, recordAttn=False, name='DPLA'):
+        super(DeepPseudoLabelwiseAttention, self).__init__()
+        if L>-1:
+            self.inLWA = nn.Linear(inSize, M)
+
+            hdnLWAs,hdnFCs,hdnBNs,hdnActFuncs = [],[],[],[]
+            for i in range(L):
+                hdnFCs.append(nn.Linear(inSize,inSize))
+                hdnBNs.append(nn.BatchNorm1d(inSize))
+                hdnActFuncs.append(actFunc())
+                hdnLWAs.append(nn.Linear(inSize, M))
+            self.hdnLWAs = nn.ModuleList(hdnLWAs)
+            self.hdnFCs = nn.ModuleList(hdnFCs)
+            self.hdnBNs = nn.ModuleList(hdnBNs)
+            self.hdnActFuncs = nn.ModuleList(hdnActFuncs)
+
+        self.outFC = nn.Linear(inSize, inSize*dkEnhance)
+        self.outBN = nn.BatchNorm1d(inSize*dkEnhance)
+        self.outActFunc = actFunc()
+        self.outLWA = nn.Linear(inSize*dkEnhance, classNum)
+
+        self.dropout = nn.Dropout(p=hdnDropout)
+        self.name = name
+        self.L = L
+
+        self.recordAttn = recordAttn
+    def forward(self, x):
+        # x: batchSize × seqLen × inSize
+        if self.recordAttn:
+            attn = None
+        if self.L>-1:
+            # input layer
+            score = self.inLWA(x) # => batchSize × seqLen × M
+            alpha = self.dropout(F.softmax(score,dim=1)) # => batchSize × seqLen × M
+            if self.recordAttn:
+                attn = alpha.detach().cpu().data.numpy()
+            a_nofc = alpha.transpose(1,2) @ x # => batchSize × M × inSize
+
+            # hidden layers
+            score = 0
+            for i,(lwa,fc,bn,act) in enumerate(zip(self.hdnLWAs,self.hdnFCs,self.hdnBNs,self.hdnActFuncs)):
+                a = fc(a_nofc) # => batchSize × M × inSize
+                a = bn(a.transpose(1,2)).transpose(1,2) # => batchSize × M × inSize
+                a_pre = self.dropout(act(a)) #  + a_nofc # => batchSize × M × inSize
+
+                score = lwa(a_pre)# + score
+                alpha = self.dropout(F.softmax(score,dim=1))
+                if self.recordAttn:
+                    attn @= alpha.detach().cpu().data.numpy()
+                a_nofc = alpha.transpose(1,2) @ a_pre + a_nofc # => batchSize × M × inSize
+
+            a_nofc = self.dropout(a_nofc)
+        else:
+            a_nofc = x 
+
+        # output layers
+        if self.L>-1:
+            a = self.outFC(a_nofc) # => batchSize × M × inSize
+            a = self.outBN(a.transpose(1,2)).transpose(1,2) # => batchSize × M × inSize
+            a = self.dropout(self.outActFunc(a)) # => batchSize × M × inSize
+        else:
+            a = a_nofc
+
+        score = self.outLWA(a) # => batchSize × M × classNum
+        alpha = self.dropout(F.softmax(score,dim=1)) # => batchSize × M × classNum
+        if self.recordAttn:
+            if attn is None:
+                attn = alpha.detach().cpu().data.numpy()
+            else:
+                attn @= alpha.detach().cpu().data.numpy()
+        x = alpha.transpose(1,2) @ a # => batchSize × classNum × inSize
+        
+        return x,attn if self.recordAttn else None
